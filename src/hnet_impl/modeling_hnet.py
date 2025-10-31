@@ -289,7 +289,7 @@ class HNet(nn.Module):
                 )
 
                 perm = torch.cat([x_flat_dest_idx, prefix_flat_dest_idx], dim=0)
-                perm_expanded = perm.expand(-1, x_flat.shape[1])
+                perm_expanded = perm.unsqueeze(1).expand(-1, x_flat.shape[1])
 
                 concated_flat = torch.cat([x_flat, prefix_flat], dim=0)
                 concated_flat = torch.gather(concated_flat, 0, perm_expanded)
@@ -300,7 +300,9 @@ class HNet(nn.Module):
 
                 inverse_perm = perm.argsort()
                 h_pos_in_concated = inverse_perm[: x_flat.shape[0]]
-                h_pos_expanded = h_pos_in_concated.expand(-1, concated_h.shape[1])
+                h_pos_expanded = h_pos_in_concated.unsqueeze(1).expand(
+                    -1, concated_h.shape[1]
+                )
                 h = torch.gather(concated_h, 0, h_pos_expanded)
                 return h, []
 
