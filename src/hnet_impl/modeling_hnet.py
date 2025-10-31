@@ -285,7 +285,7 @@ class HNet(nn.Module):
                 ).sum(dim=1)
                 prefix_flat_dest_idx = (
                     torch.arange(prefix_flat.shape[0], device=prefix_flat.device)
-                    + prefix_cu[prefix_flat_batch_idx]
+                    + flat_cu[prefix_flat_batch_idx]
                 )
 
                 perm = torch.cat([x_flat_dest_idx, prefix_flat_dest_idx], dim=0)
