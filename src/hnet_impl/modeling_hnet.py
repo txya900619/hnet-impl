@@ -1,14 +1,14 @@
-from dataclasses import dataclass
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
-from .torchisms import torch, TT, nn, F, nested, NJT, summon_full_params
 from .conceptual import BlockBoundaryMixin, get_seq_idx
 from .config_hnet import HNetConfig
+from .lin import HighPrecLinear, Lin, LMHead
+from .torchisms import NJT, TT, F, nested, nn, summon_full_params, torch
 from .xf import Isotropic
-from .lin import Lin, HighPrecLinear, LMHead
 
 ### ################
 ### H-Net submodules
@@ -238,7 +238,14 @@ class HNet(nn.Module):
         for outer in outer_flat_tensors:
             mutable_res.append(outer.index_select(0, idx_flat))
 
-    def forward(self, x_flat: TT, flat_cu: TT, msl: int):
+    def forward(
+        self,
+        x_flat: TT,
+        flat_cu: TT,
+        msl: int,
+        prefix_flat: TT | None = None,
+        prefix_cu: TT | None = None,
+    ):
         d_orig = x_flat.shape[-1]
         x_flat = (
             x_flat
@@ -250,6 +257,53 @@ class HNet(nn.Module):
         x_flat = x_flat.bfloat16()
 
         if self.is_innermost:
+            if prefix_flat is not None and prefix_cu is not None:
+                # x_flat is [a, a, a, a, a, b, b, b, b, ...]
+                # prefix_flat is [aj, aj, aj, aj, bj, bj, bj, ...]
+                # concated_flat need to be [a, a, a, a, a, aj, aj, aj, aj, b, b, b, b, bj, bj, bj, ...]
+                # flat_cu is [0, 5, 9, ...]
+                # prefix_cu is [0 ,4, 7, ...]
+                # concated_cu need to be [0, 9, 16, ...]
+                # perm of concated_flat need to be [0, 1, 2, 3, 4, 9, 10, 11, 12, 13, ..., 5, 6, 7, 8, 14, 15, 16, ...]
+
+                concated_cu = flat_cu + prefix_cu
+                concated_msl = concated_cu.diff().max().item()
+
+                x_flat_batch_idx = (
+                    torch.arange(x_flat.shape[0], device=x_flat.device).unsqueeze(1)
+                    > flat_cu[1:] - 1
+                ).sum(dim=1)
+                x_flat_dest_idx = (
+                    torch.arange(x_flat.shape[0], device=x_flat.device)
+                    + prefix_cu[x_flat_batch_idx + 1]
+                )
+                prefix_flat_batch_idx = (
+                    torch.arange(
+                        prefix_flat.shape[0], device=prefix_flat.device
+                    ).unsqueeze(1)
+                    > prefix_cu[1:] - 1
+                ).sum(dim=1)
+                prefix_flat_dest_idx = (
+                    torch.arange(prefix_flat.shape[0], device=prefix_flat.device)
+                    + prefix_cu[prefix_flat_batch_idx]
+                )
+
+                perm = torch.cat([x_flat_dest_idx, prefix_flat_dest_idx], dim=0)
+                perm_expanded = perm.expand(-1, x_flat.shape[1])
+
+                concated_flat = torch.cat([x_flat, prefix_flat], dim=0)
+                concated_flat = torch.gather(concated_flat, 0, perm_expanded)
+
+                concated_h = self.main_network(
+                    concated_flat, concated_cu, concated_msl
+                )[..., :d_orig]
+
+                inverse_perm = perm.argsort()
+                h_pos_in_concated = inverse_perm[: x_flat.shape[0]]
+                h_pos_expanded = h_pos_in_concated.expand(-1, concated_h.shape[1])
+                h = torch.gather(concated_h, 0, h_pos_expanded)
+                return h, []
+
             return self.main_network(x_flat, flat_cu, msl)[..., :d_orig], []
 
         r_flat = self.encoder(x_flat, flat_cu, msl)
@@ -269,7 +323,7 @@ class HNet(nn.Module):
         p_select, r_select = pending_selected_tensors
 
         h_select, extras = self.main_network(
-            r_select, select_cu, pending_cpu_stats[0].item()
+            r_select, select_cu, pending_cpu_stats[0].item(), innermost_prefix
         )
 
         x_flat = self.dechunk_layer(
@@ -349,6 +403,7 @@ class HNetLM(BlockBoundaryMixin, nn.Module):
 
 def test_fwd_correctness():
     import re
+
     from .sampling import ByteTokenizer, completion_sync
 
     ## load hardcoded model
