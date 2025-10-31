@@ -323,7 +323,11 @@ class HNet(nn.Module):
         p_select, r_select = pending_selected_tensors
 
         h_select, extras = self.main_network(
-            r_select, select_cu, pending_cpu_stats[0].item(), innermost_prefix
+            r_select,
+            select_cu,
+            pending_cpu_stats[0].item(),
+            prefix_flat,
+            prefix_cu,
         )
 
         x_flat = self.dechunk_layer(
