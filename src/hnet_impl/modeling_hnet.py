@@ -241,7 +241,7 @@ class HNet(nn.Module):
     def forward(
         self,
         x_flat: TT,
-        flat_cu: TT,
+        x_cu: TT,
         msl: int,
         prefix_flat: TT | None = None,
         prefix_cu: TT | None = None,
@@ -266,12 +266,12 @@ class HNet(nn.Module):
                 # concated_cu need to be [0, 9, 16, ...]
                 # perm of concated_flat need to be [0, 1, 2, 3, 4, 9, 10, 11, 12, 13, ..., 5, 6, 7, 8, 14, 15, 16, ...]
 
-                concated_cu = flat_cu + prefix_cu
+                concated_cu = x_cu + prefix_cu
                 concated_msl = concated_cu.diff().max().item()
 
                 x_flat_batch_idx = (
                     torch.arange(x_flat.shape[0], device=x_flat.device).unsqueeze(1)
-                    > flat_cu[1:] - 1
+                    > x_cu[1:] - 1
                 ).sum(dim=1)
                 x_flat_dest_idx = (
                     torch.arange(x_flat.shape[0], device=x_flat.device)
@@ -285,10 +285,12 @@ class HNet(nn.Module):
                 ).sum(dim=1)
                 prefix_flat_dest_idx = (
                     torch.arange(prefix_flat.shape[0], device=prefix_flat.device)
-                    + flat_cu[prefix_flat_batch_idx]
+                    + x_cu[prefix_flat_batch_idx]
                 )
 
-                perm = torch.cat([x_flat_dest_idx, prefix_flat_dest_idx], dim=0)
+                inverse_perm = torch.cat([x_flat_dest_idx, prefix_flat_dest_idx], dim=0)
+                perm = inverse_perm.argsort()
+
                 perm_expanded = perm.unsqueeze(1).expand(-1, x_flat.shape[1])
 
                 concated_flat = torch.cat([x_flat, prefix_flat], dim=0)
@@ -298,7 +300,6 @@ class HNet(nn.Module):
                     concated_flat, concated_cu, concated_msl
                 )[..., :d_orig]
 
-                inverse_perm = perm.argsort()
                 h_pos_in_concated = inverse_perm[: x_flat.shape[0]]
                 h_pos_expanded = h_pos_in_concated.unsqueeze(1).expand(
                     -1, concated_h.shape[1]
@@ -306,10 +307,10 @@ class HNet(nn.Module):
                 h = torch.gather(concated_h, 0, h_pos_expanded)
                 return h, []
 
-            return self.main_network(x_flat, flat_cu, msl)[..., :d_orig], []
+            return self.main_network(x_flat, x_cu, msl)[..., :d_orig], []
 
-        r_flat = self.encoder(x_flat, flat_cu, msl)
-        p_flat, b_flat, select_cu = self.routing_module(r_flat, flat_cu)
+        r_flat = self.encoder(x_flat, x_cu, msl)
+        p_flat, b_flat, select_cu = self.routing_module(r_flat, x_cu)
 
         # obtaining r_select/p_select would require a cpu-sync'ing .masked_select in normal circumstances.
         # To avoid this, we initiate a D2H of the inner H-Net's seqlen ASAP, and enqueue work to let the GPU race ahead.
@@ -336,10 +337,10 @@ class HNet(nn.Module):
             h_select, b_flat, p_select, get_seq_idx(select_cu, p_select.shape[0])
         )
         x_flat = (residual + x_flat.float() * ste_func(c_flat)).type_as(x_flat)
-        x_flat = self.decoder(x_flat, flat_cu, msl)[..., :d_orig]
+        x_flat = self.decoder(x_flat, x_cu, msl)[..., :d_orig]
 
         extra = HNetExtra(
-            nested.nested_tensor_from_jagged(b_flat, flat_cu, max_seqlen=msl),
+            nested.nested_tensor_from_jagged(b_flat, x_cu, max_seqlen=msl),
             ratio_loss,
             p_select.numel() / p_flat.numel(),
         )
