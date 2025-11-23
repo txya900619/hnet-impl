@@ -328,7 +328,8 @@ class HNet(nn.Module):
         p_flat, b_flat, select_cu = self.routing_module(r_flat, x_cu)
 
         if chunk_mask_flat is not None:
-            b_flat = b_flat & chunk_mask_flat
+            b_flat = b_flat | (~chunk_mask_flat)
+            p_flat = torch.where(chunk_mask_flat, p_flat, torch.ones_like(p_flat))
             select_cu = F.pad(b_flat.cumsum(0), (1, 0))[x_cu]
 
         # obtaining r_select/p_select would require a cpu-sync'ing .masked_select in normal circumstances.
@@ -342,13 +343,7 @@ class HNet(nn.Module):
                 if torch.is_grad_enabled()
                 else 0
             )
-            c_base = torch.where(b_flat, p_flat, 1 - p_flat)[..., None]
-            if chunk_mask_flat is not None:
-                c_flat = torch.where(
-                    chunk_mask_flat[:, None], c_base, torch.ones_like(c_base)
-                )
-            else:
-                c_flat = c_base
+            c_flat = torch.where(b_flat, p_flat, 1 - p_flat)[..., None]
             residual = self.residual_proj(r_flat)
         p_select, r_select = pending_selected_tensors
         chunk_mask_select = (
