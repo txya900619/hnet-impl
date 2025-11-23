@@ -374,10 +374,16 @@ class HNet(nn.Module):
             max(chunkable_tokens, 1) if chunkable_tokens is not None else p_flat.numel()
         )
 
+        selected_tokens = (
+            (b_flat * chunk_mask_flat).sum()
+            if chunk_mask_flat is not None
+            else p_select.numel()
+        )
+
         extra = HNetExtra(
             nested.nested_tensor_from_jagged(b_flat, x_cu, max_seqlen=msl),
             ratio_loss,
-            p_select.numel() / chunkable_tokens,
+            selected_tokens / chunkable_tokens,
         )
 
         return x_flat, [extra] + extras
