@@ -207,14 +207,23 @@ class HNet(nn.Module):
             self.ratio_loss, backend="inductor", fullgraph=True, dynamic=True
         )
 
-    def ratio_loss(self, b_flat: TT, p_flat: TT):
+    def ratio_loss(self, b_flat: TT, p_flat: TT, mask_flat: TT | None = None):
         assert self.n, "HNetConfig did not receive valid N_compress; please edit it"
-        l = b_flat.numel()
-        f = b_flat.sum().float() / l
-        g = p_flat.float().sum() / l
+        if mask_flat is None:
+            mask_flat = torch.ones_like(b_flat, dtype=torch.bool, device=b_flat.device)
+        else:
+            mask_flat = mask_flat.to(b_flat.device, non_blocking=True, dtype=torch.bool)
+
+        mask = mask_flat.float()
+        mask_sum = mask.sum()
+        safe_mask_sum = mask_sum.clamp_min(1)
+
+        f = (b_flat.float() * mask).sum() / safe_mask_sum
+        g = (p_flat.float() * mask).sum() / safe_mask_sum
         drop_experts = self.n * (1 - f) * (1 - g) / (self.n - 1)
         keep_expert = self.n * f * g
-        return keep_expert + drop_experts
+        loss = keep_expert + drop_experts
+        return torch.where(mask_sum == 0, loss.new_zeros(()), loss)
 
     @contextmanager
     def least_blocking_masked_select(
@@ -243,6 +252,7 @@ class HNet(nn.Module):
         x_flat: TT,
         x_cu: TT,
         msl: int,
+        chunk_mask_flat: TT | None = None,
         prefix_flat: TT | None = None,
         prefix_cu: TT | None = None,
     ):
@@ -255,6 +265,11 @@ class HNet(nn.Module):
             )
         )
         x_flat = x_flat.bfloat16()
+
+        if chunk_mask_flat is not None:
+            chunk_mask_flat = chunk_mask_flat.to(
+                x_flat.device, non_blocking=True, dtype=torch.bool
+            )
 
         if self.is_innermost:
             if prefix_flat is not None and prefix_cu is not None:
@@ -312,6 +327,10 @@ class HNet(nn.Module):
         r_flat = self.encoder(x_flat, x_cu, msl)
         p_flat, b_flat, select_cu = self.routing_module(r_flat, x_cu)
 
+        if chunk_mask_flat is not None:
+            b_flat = b_flat & chunk_mask_flat
+            select_cu = F.pad(b_flat.cumsum(0), (1, 0))[x_cu]
+
         # obtaining r_select/p_select would require a cpu-sync'ing .masked_select in normal circumstances.
         # To avoid this, we initiate a D2H of the inner H-Net's seqlen ASAP, and enqueue work to let the GPU race ahead.
         # Note that, if you are **already CPU bound** prior to this (e.g. in really small runs), this code is detrimental.
@@ -319,18 +338,32 @@ class HNet(nn.Module):
             p_flat, r_flat, mask_flat=b_flat, cu_seqlens=select_cu
         ) as (pending_selected_tensors, pending_cpu_stats):
             ratio_loss = (
-                self.ratio_loss(b_flat, p_flat) if torch.is_grad_enabled() else 0
+                self.ratio_loss(b_flat, p_flat, chunk_mask_flat)
+                if torch.is_grad_enabled()
+                else 0
             )
-            c_flat = torch.where(b_flat, p_flat, 1 - p_flat)[..., None]
+            c_base = torch.where(b_flat, p_flat, 1 - p_flat)[..., None]
+            if chunk_mask_flat is not None:
+                c_flat = torch.where(
+                    chunk_mask_flat[:, None], c_base, torch.ones_like(c_base)
+                )
+            else:
+                c_flat = c_base
             residual = self.residual_proj(r_flat)
         p_select, r_select = pending_selected_tensors
+        chunk_mask_select = (
+            torch.masked_select(chunk_mask_flat, b_flat)
+            if chunk_mask_flat is not None
+            else None
+        )
 
         h_select, extras = self.main_network(
             r_select,
             select_cu,
             pending_cpu_stats[0].item(),
-            prefix_flat,
-            prefix_cu,
+            chunk_mask_flat=chunk_mask_select,
+            prefix_flat=prefix_flat,
+            prefix_cu=prefix_cu,
         )
 
         x_flat = self.dechunk_layer(
@@ -339,10 +372,17 @@ class HNet(nn.Module):
         x_flat = (residual + x_flat.float() * ste_func(c_flat)).type_as(x_flat)
         x_flat = self.decoder(x_flat, x_cu, msl)[..., :d_orig]
 
+        chunkable_tokens = (
+            int(chunk_mask_flat.sum().item()) if chunk_mask_flat is not None else None
+        )
+        chunkable_tokens = (
+            max(chunkable_tokens, 1) if chunkable_tokens is not None else p_flat.numel()
+        )
+
         extra = HNetExtra(
             nested.nested_tensor_from_jagged(b_flat, x_cu, max_seqlen=msl),
             ratio_loss,
-            p_select.numel() / p_flat.numel(),
+            p_select.numel() / chunkable_tokens,
         )
 
         return x_flat, [extra] + extras
@@ -364,12 +404,18 @@ class HNetLM(BlockBoundaryMixin, nn.Module):
     #    use logits for autoregressive sampling.
     #    use extras[] to grab selected token IDs (b) for sampling pretty-printing.
     def forward(
-        self, iids: TT, lbls: TT | None = None
+        self,
+        iids: TT,
+        lbls: TT | None = None,
+        *,
+        chunk_mask_flat: TT | None = None,
     ) -> tuple[TT | tuple[TT, TT], list]:
         assert iids.is_nested and iids.ndim == 2
         cu_s, msl = iids.offsets(), iids._max_seqlen
         x_flat = self.embeddings(iids.values())
-        x_flat, extra = self.backbone(x_flat, cu_s, msl)
+        x_flat, extra = self.backbone(
+            x_flat, cu_s, msl, chunk_mask_flat=chunk_mask_flat
+        )
         res = self.lm_head(x_flat, lbls if lbls is None else lbls.values())
         if lbls is None:
             res = nested.nested_tensor_from_jagged(res, cu_s, max_seqlen=msl)
