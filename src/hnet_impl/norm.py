@@ -4,22 +4,13 @@ import torch
 import triton
 import triton.language as tl
 
-# Map torch dtype to triton dtype for constexpr specialization
-TORCH_TO_TRITON_DTYPE = {
-    torch.bfloat16: tl.bfloat16,
-    torch.float16: tl.float16,
-    torch.float32: tl.float32,
-}
-
-# Integer codes for triton constexpr (triton can't use Python objects as constexpr)
-DTYPE_CODE_BF16 = 0
-DTYPE_CODE_FP16 = 1
-DTYPE_CODE_FP32 = 2
-
+# Integer codes for dtype selection in triton kernels
+# These are used as constexpr values - triton will specialize kernels for each value
+# 0 = bfloat16, 1 = float16, 2 = float32
 TORCH_DTYPE_TO_CODE = {
-    torch.bfloat16: DTYPE_CODE_BF16,
-    torch.float16: DTYPE_CODE_FP16,
-    torch.float32: DTYPE_CODE_FP32,
+    torch.bfloat16: 0,
+    torch.float16: 1,
+    torch.float32: 2,
 }
 
 
@@ -34,12 +25,15 @@ def triton_autotune_configs(warp_size=32, max_threads_per_block=1024):
 
 @triton.jit
 def _cast_to_dtype(x, DTYPE_CODE: tl.constexpr):
-    """Cast tensor to specified dtype using constexpr code for specialization."""
-    if DTYPE_CODE == DTYPE_CODE_BF16:
+    """Cast tensor to specified dtype using constexpr code for specialization.
+    DTYPE_CODE: 0=bfloat16, 1=float16, 2=float32
+    """
+    # Use literal integers - Triton will compile separate kernel versions for each value
+    if DTYPE_CODE == 0:  # bfloat16
         return x.to(tl.bfloat16)
-    elif DTYPE_CODE == DTYPE_CODE_FP16:
+    elif DTYPE_CODE == 1:  # float16
         return x.to(tl.float16)
-    else:  # DTYPE_CODE_FP32
+    else:  # float32
         return x.to(tl.float32)
 
 
