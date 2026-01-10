@@ -158,6 +158,7 @@ class HNet(nn.Module):
         super().__init__()
         self.stage_idx = stage_idx
         self.d = c.d_model[stage_idx]
+        self.compute_dtype = c.compute_dtype
         try:
             self.n = c.N_compress[stage_idx + 1] / c.N_compress[stage_idx]
         except IndexError:
@@ -264,7 +265,7 @@ class HNet(nn.Module):
                 [x_flat, self.pad_dimension.expand(x_flat.shape[0], -1)], dim=-1
             )
         )
-        x_flat = x_flat.bfloat16()
+        x_flat = x_flat.to(self.compute_dtype)
 
         if chunk_mask_flat is not None:
             chunk_mask_flat = chunk_mask_flat.to(
@@ -393,6 +394,7 @@ class HNetLM(BlockBoundaryMixin, nn.Module):
     def __init__(self, c: HNetConfig):
         super().__init__()
         self.c, v, d = c, c.vocab_size, c.d_model[0]
+        self.compute_dtype = c.compute_dtype
         self.embeddings = nn.Embedding(v, d)
         self.backbone = HNet(c, stage_idx=0)
         self.lm_head = LMHead(d, v)
@@ -450,7 +452,7 @@ class HNetLM(BlockBoundaryMixin, nn.Module):
         with (
             summon_full_params(self),
             torch.compiler.set_stance("force_eager"),
-            torch.autocast("cuda", torch.bfloat16, cache_enabled=False),
+            torch.autocast("cuda", self.compute_dtype, cache_enabled=False),
         ):
             yield
 
@@ -464,7 +466,7 @@ def test_fwd_correctness():
     c = HNetConfig.load_config("hnet_2stage_XL.json")
     t = ByteTokenizer()
     with torch.device("cuda"):
-        m = HNetLM(c).bfloat16()
+        m = HNetLM(c).to(c.compute_dtype)
     m.load_goomba_ckpt("hnet_2stage_XL.pt")
 
     ## check randint fwd logits

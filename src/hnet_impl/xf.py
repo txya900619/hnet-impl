@@ -366,8 +366,9 @@ class Block(BlockBoundaryMixin, nn.Module, metaclass=BlockMeta):
     def forward(
         self, x: TT, residual: TT, cu_seqlens: TT, max_seqlen: int, seq_idx: TT
     ):
-        assert x.dtype != residual.dtype == torch.float32, (
-            "x must be half prec, res must be fp32"
+        assert residual.dtype == torch.float32, "residual must be fp32"
+        assert x.dtype in (torch.bfloat16, torch.float16, torch.float32), (
+            f"x must be bfloat16, float16, or float32, got {x.dtype}"
         )
         x, residual = self.norm1(x, residual)
         if isinstance(self.mixer, Mamba2Simple):
@@ -380,9 +381,9 @@ class Block(BlockBoundaryMixin, nn.Module, metaclass=BlockMeta):
         return self.mlp(x), residual
 
     @staticmethod
-    def apply_fsdp(self, **kw):
+    def apply_fsdp(self, *, compute_dtype: torch.dtype = torch.bfloat16, **kw):
         mp_policy = fsdp.MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16, cast_forward_inputs=False
+            param_dtype=compute_dtype, cast_forward_inputs=False
         )
         return fsdp.fully_shard(self, **kw | {"mp_policy": mp_policy})
 
@@ -494,9 +495,10 @@ if __name__ == "__main__":
     D = c.d_model
     S0 = args.s0  # total s=0 token bsz seen per gpu
     S1 = args.s1  # total s=1 token bsz seen per gpu
+    compute_dtype = c.compute_dtype
 
     ## create models
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(compute_dtype)
     with torch.device("cuda"):
         enc = Isotropic(c, f"m{args.lm}", 0)
         net = Isotropic(c, f"T{args.lt}", 1)
@@ -512,7 +514,7 @@ if __name__ == "__main__":
 
     ## a. test normal sequences (unpadded njt with reasonable max total seqlen)
     def rand_x(*a):
-        return random_x(*a, device="cuda", dtype=torch.bfloat16, s_min=256, s_max=2048)
+        return random_x(*a, device="cuda", dtype=compute_dtype, s_min=256, s_max=2048)
 
     dl_0 = ((x, torch.randn_like(x)) for x in rand_x(D[0], S0))
     dl_1 = ((x, torch.randn_like(x)) for x in rand_x(D[1], S1))
@@ -522,7 +524,7 @@ if __name__ == "__main__":
 
     ## b. test very short sequences (certain kernels are not careful with oob)
     def short_x(d):
-        return random_x(d, 30, device="cuda", dtype=torch.bfloat16, s_min=4, s_max=16)
+        return random_x(d, 30, device="cuda", dtype=compute_dtype, s_min=4, s_max=16)
 
     dl_short_0 = ((x, torch.randn_like(x)) for x in short_x(D[0]))
     dl_short_1 = ((x, torch.randn_like(x)) for x in short_x(D[1]))

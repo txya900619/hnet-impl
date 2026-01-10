@@ -1,7 +1,26 @@
 import math
+
 import torch
 import triton
 import triton.language as tl
+
+# Map torch dtype to triton dtype for constexpr specialization
+TORCH_TO_TRITON_DTYPE = {
+    torch.bfloat16: tl.bfloat16,
+    torch.float16: tl.float16,
+    torch.float32: tl.float32,
+}
+
+# Integer codes for triton constexpr (triton can't use Python objects as constexpr)
+DTYPE_CODE_BF16 = 0
+DTYPE_CODE_FP16 = 1
+DTYPE_CODE_FP32 = 2
+
+TORCH_DTYPE_TO_CODE = {
+    torch.bfloat16: DTYPE_CODE_BF16,
+    torch.float16: DTYPE_CODE_FP16,
+    torch.float32: DTYPE_CODE_FP32,
+}
 
 
 # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit
@@ -13,13 +32,24 @@ def triton_autotune_configs(warp_size=32, max_threads_per_block=1024):
     ]
 
 
-@triton.autotune(configs=triton_autotune_configs(), key=["N"])
+@triton.jit
+def _cast_to_dtype(x, DTYPE_CODE: tl.constexpr):
+    """Cast tensor to specified dtype using constexpr code for specialization."""
+    if DTYPE_CODE == DTYPE_CODE_BF16:
+        return x.to(tl.bfloat16)
+    elif DTYPE_CODE == DTYPE_CODE_FP16:
+        return x.to(tl.float16)
+    else:  # DTYPE_CODE_FP32
+        return x.to(tl.float32)
+
+
+@triton.autotune(configs=triton_autotune_configs(), key=["N", "DTYPE_CODE"])
 @triton.jit
 def _rms_norm_fwd_kernel(
-    X,  # *in*  bf16  [M, N]
+    X,  # *in*  half/fp32  [M, N]
     RES,  # *in*  fp32  [M, N]
     WEIGHT,  # *in*  fp32  [N]
-    Y_OUT,  # *out* bf16  [M, N]  (weighted x_hat)
+    Y_OUT,  # *out* half/fp32  [M, N]  (weighted x_hat)
     RES_OUT,  # *out* fp32  [M, N]  (combined pre-norm)
     M,
     N,  # ints
@@ -27,6 +57,7 @@ def _rms_norm_fwd_kernel(
     ALPHA_X: tl.constexpr,  # float (compile-time)
     ALPHA_RES: tl.constexpr,  # float (compile-time)
     BLOCK_N: tl.constexpr,  # power-of-two tile
+    DTYPE_CODE: tl.constexpr,  # output dtype code
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
@@ -38,7 +69,7 @@ def _rms_norm_fwd_kernel(
     Y_OUT += row * N
     RES_OUT += row * N
 
-    # always load to fp32
+    # always load to fp32 for numerical stability
     x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
     res = tl.load(RES + cols, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(WEIGHT + cols, mask=mask, other=0.0).to(tl.float32)
@@ -50,20 +81,20 @@ def _rms_norm_fwd_kernel(
     rstd = 1.0 / tl.sqrt(mean_sq + EPS)
     x_hat = x_comb * rstd
 
-    y = (x_hat * w).to(tl.bfloat16)
+    y = _cast_to_dtype(x_hat * w, DTYPE_CODE)
 
     tl.store(Y_OUT + cols, y, mask=mask)
     tl.store(RES_OUT + cols, x_comb, mask=mask)
 
 
-@triton.autotune(configs=triton_autotune_configs(), key=["N"])
+@triton.autotune(configs=triton_autotune_configs(), key=["N", "DTYPE_CODE"])
 @triton.jit
 def _rms_norm_bwd_kernel(
     RES_OUT,  # *in*  fp32  [M, N]  (from forward; combined input)
     DRES_OUT,  # *in*  fp32  [M, N]  (upstream grad wrt res_out)
-    DY,  # *in*  bf16  [M, N]
+    DY,  # *in*  half/fp32  [M, N]
     WEIGHT,  # *in*  fp32  [N]
-    DX,  # *out* bf16  [M, N]
+    DX,  # *out* half/fp32  [M, N]
     DRES,  # *out* fp32  [M, N]
     DW_PARTIAL,  # *out* fp32  [M, N]
     M: int,
@@ -72,6 +103,7 @@ def _rms_norm_bwd_kernel(
     ALPHA_X: tl.constexpr,
     ALPHA_RES: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    DTYPE_CODE: tl.constexpr,  # output dtype code
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
@@ -102,7 +134,7 @@ def _rms_norm_bwd_kernel(
     d_xcomb_from_y = (d_xhat - x_hat * c1) * rstd
     d_xcomb = d_xcomb_from_y + d_res_out
 
-    dx = (ALPHA_X * d_xcomb).to(tl.bfloat16)
+    dx = _cast_to_dtype(ALPHA_X * d_xcomb, DTYPE_CODE)
     dres = ALPHA_RES * d_xcomb
 
     tl.store(DX + cols, dx, mask=mask)
@@ -114,44 +146,50 @@ def _rms_norm_bwd_kernel(
 
 
 def get_block_n(n: int, esize: int):
-    # Less than 64KB per feature: enqueue fused kerne>l
+    # Less than 64KB per feature: enqueue fused kernel
     block_n = min(65536 // esize, triton.next_power_of_2(n))
     assert n <= block_n, "This RMSNorm doesn't support feature dim >= 64KB."
     return block_n
 
 
-class _RMSNormBF16FP32Fn(torch.autograd.Function):
+class _RMSNormMixedPrecFn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        x_bf16: torch.Tensor,
+        x: torch.Tensor,
         residual_f32: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
         alpha_x: float,
         alpha_res: float,
     ):
-        x_shape = x_bf16.shape
+        x_shape = x.shape
         N = x_shape[-1]
         M = math.prod(x_shape[:-1])
+        x_dtype = x.dtype
+
         # shape & dtype checks
-        assert x_bf16.dtype == torch.bfloat16, "x must be bfloat16"
+        assert x_dtype in (torch.bfloat16, torch.float16, torch.float32), (
+            f"x must be bfloat16, float16, or float32, got {x_dtype}"
+        )
         assert residual_f32.dtype == torch.float32, "residual must be float32"
-        assert x_bf16.shape == residual_f32.shape and x_bf16.ndim >= 2
+        assert x.shape == residual_f32.shape and x.ndim >= 2
         assert weight.ndim == 1 and weight.shape[0] == N, (
             "weight must be 1D contiguous with length N"
         )
 
         # Collapse to 2D [M, N] with contiguous last dim
-        x2 = x_bf16.view(M, N).contiguous()
+        x2 = x.view(M, N).contiguous()
         res2 = residual_f32.view(M, N).contiguous()
         assert x2.stride(-1) == 1 and res2.stride(-1) == 1, (
             "last dim must be contiguous"
         )
 
-        # Allocate outputs
-        y2 = torch.empty_like(x2, dtype=torch.bfloat16)
+        # Allocate outputs (same dtype as input for y)
+        y2 = torch.empty_like(x2, dtype=x_dtype)
         res_out = torch.empty_like(res2, dtype=torch.float32)
+
+        dtype_code = TORCH_DTYPE_TO_CODE[x_dtype]
 
         _rms_norm_fwd_kernel[(M,)](
             x2,
@@ -164,21 +202,24 @@ class _RMSNormBF16FP32Fn(torch.autograd.Function):
             EPS=float(eps),
             ALPHA_X=float(alpha_x),
             ALPHA_RES=float(alpha_res),
-            BLOCK_N=get_block_n(N, x_bf16.element_size()),
+            BLOCK_N=get_block_n(N, x.element_size()),
+            DTYPE_CODE=dtype_code,
         )
 
         # Save for backward
         ctx.eps = float(eps)
         ctx.alpha_x = float(alpha_x)
         ctx.alpha_res = float(alpha_res)
+        ctx.x_dtype = x_dtype
         ctx.save_for_backward(res_out, weight)
         ctx.shape = x_shape
 
         return y2.view(x_shape), res_out
 
     @staticmethod
-    def backward(ctx, dy_bf16: torch.Tensor, dres_out_f32: torch.Tensor):
-        assert dy_bf16.dtype == torch.bfloat16, "grad_out must be bfloat16"
+    def backward(ctx, dy: torch.Tensor, dres_out_f32: torch.Tensor):
+        x_dtype = ctx.x_dtype
+        assert dy.dtype == x_dtype, f"grad_out must be {x_dtype}, got {dy.dtype}"
         assert dres_out_f32.dtype == torch.float32
 
         (res_out, weight) = ctx.saved_tensors
@@ -186,16 +227,18 @@ class _RMSNormBF16FP32Fn(torch.autograd.Function):
         M = math.prod(x_shape[:-1])
         N = x_shape[-1]
 
-        dy2 = dy_bf16.view(M, N).contiguous()
+        dy2 = dy.view(M, N).contiguous()
         res_out2 = res_out.view(M, N).contiguous()
         dres_out2 = dres_out_f32.view(M, N).contiguous().to(torch.float32)
         assert dy2.stride(-1) == 1 == res_out2.stride(-1) == dres_out2.stride(-1)
 
-        dx2 = torch.empty_like(dy2, dtype=torch.bfloat16)
+        dx2 = torch.empty_like(dy2, dtype=x_dtype)
         dres2 = torch.empty_like(res_out2, dtype=torch.float32)
         dweight_partials = torch.empty(
             (M, N), dtype=torch.float32, device=weight.device
         )
+
+        dtype_code = TORCH_DTYPE_TO_CODE[x_dtype]
 
         _rms_norm_bwd_kernel[(M,)](
             res_out2,
@@ -210,7 +253,8 @@ class _RMSNormBF16FP32Fn(torch.autograd.Function):
             EPS=ctx.eps,
             ALPHA_X=ctx.alpha_x,
             ALPHA_RES=ctx.alpha_res,
-            BLOCK_N=get_block_n(N, dy_bf16.element_size()),
+            BLOCK_N=get_block_n(N, dy.element_size()),
+            DTYPE_CODE=dtype_code,
         )
 
         # Reduce partials across rows to get [N]
@@ -221,7 +265,7 @@ class _RMSNormBF16FP32Fn(torch.autograd.Function):
 
 
 def fused_rmsnorm_with_residual(
-    x_bf16: torch.Tensor,
+    x: torch.Tensor,
     residual_f32: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
@@ -230,21 +274,23 @@ def fused_rmsnorm_with_residual(
 ):
     """
     y = weight * (alpha_x * x + alpha_res * residual) / sqrt(mean((alpha_x*x + alpha_res*residual)^2) + eps)
-    - x_bf16:     bfloat16 tensor [..., N]
+    - x:          bfloat16, float16, or float32 tensor [..., N]
     - residual:   float32 tensor [..., N]
     - weight:     float32 tensor [N] (required)
     - eps, alpha_x, alpha_res: Python floats (constexpr to Triton)
-    Returns y in bfloat16. Autograd yields dx in bfloat16, dres/dweight in float32.
+    Returns y in same dtype as x. Autograd yields dx in same dtype as x, dres/dweight in float32.
     """
-    return _RMSNormBF16FP32Fn.apply(
-        x_bf16, residual_f32, weight, eps, alpha_x, alpha_res
-    )
+    return _RMSNormMixedPrecFn.apply(x, residual_f32, weight, eps, alpha_x, alpha_res)
 
 
-def rmsnorm_with_residual_native(x_bf16, residual_f32, weight, eps, alpha_x, alpha_res):
-    comb = alpha_x * x_bf16.float() + alpha_res * residual_f32
+# Keep the old name for backward compatibility
+_RMSNormBF16FP32Fn = _RMSNormMixedPrecFn
+
+
+def rmsnorm_with_residual_native(x, residual_f32, weight, eps, alpha_x, alpha_res):
+    comb = alpha_x * x.float() + alpha_res * residual_f32
     y32 = torch.nn.functional.rms_norm(comb, (weight.shape[0],), weight, eps)
-    return y32.to(torch.bfloat16), comb
+    return y32.to(x.dtype), comb
 
 
 def compare_fused_vs_native(x, res, w, ax, ar, eps=1e-5):
@@ -261,25 +307,38 @@ def compare_fused_vs_native(x, res, w, ax, ar, eps=1e-5):
     )
 
     # Native
-    x_bf16_ref = x.detach().clone().requires_grad_(True)
+    x_ref = x.detach().clone().requires_grad_(True)
     res_f32_ref = res.detach().clone().requires_grad_(True)
     w_f32_ref = w.detach().clone().requires_grad_(True)
 
     y_ref, r_ref = rmsnorm_with_residual_native(
-        x_bf16_ref, res_f32_ref, w_f32_ref, eps, ax, ar
+        x_ref, res_f32_ref, w_f32_ref, eps, ax, ar
     )
     dx_ref, dres_ref, dw_ref = torch.autograd.grad(
         outputs=(y_ref, r_ref),
-        inputs=(x_bf16_ref, res_f32_ref, w_f32_ref),
+        inputs=(x_ref, res_f32_ref, w_f32_ref),
         grad_outputs=(g_y, g_r),
     )
 
-    # Compare
-    assert torch.allclose(y_fused, y_ref, rtol=3e-2, atol=3e-3), "forward mismatch"
-    assert torch.allclose(r_fused, r_ref, rtol=3e-2, atol=3e-3), "forward mismatch"
-    assert torch.allclose(dx_ref, dx_fused, rtol=3e-2, atol=3e-3), "dx mismatch"
-    assert torch.allclose(dres_ref, dres_fused, rtol=3e-2, atol=3e-3), "dres mismatch"
-    assert torch.allclose(dw_ref, dw_fused, rtol=3e-2, atol=3e-3), "dw mismatch"
+    # Compare (use larger tolerance for float16 due to lower precision)
+    rtol = 5e-2 if x.dtype == torch.float16 else 3e-2
+    atol = 5e-3 if x.dtype == torch.float16 else 3e-3
+
+    assert torch.allclose(y_fused, y_ref, rtol=rtol, atol=atol), (
+        f"forward mismatch for {x.dtype}"
+    )
+    assert torch.allclose(r_fused, r_ref, rtol=rtol, atol=atol), (
+        f"forward mismatch for {x.dtype}"
+    )
+    assert torch.allclose(dx_ref, dx_fused, rtol=rtol, atol=atol), (
+        f"dx mismatch for {x.dtype}"
+    )
+    assert torch.allclose(dres_ref, dres_fused, rtol=rtol, atol=atol), (
+        f"dres mismatch for {x.dtype}"
+    )
+    assert torch.allclose(dw_ref, dw_fused, rtol=rtol, atol=atol), (
+        f"dw mismatch for {x.dtype}"
+    )
 
 
 def test_fused_rmsnorm():
@@ -289,15 +348,20 @@ def test_fused_rmsnorm():
             (128, 2048),
             (77, 1536),
         ]:
-            x_bf16 = torch.randn((M, N), dtype=torch.bfloat16).requires_grad_(True)
             res_f32 = torch.randn((M, N), dtype=torch.float32).requires_grad_(True)
-            for w_dtype in [torch.float32, torch.bfloat16]:
-                w = torch.randn((N,), dtype=w_dtype).requires_grad_(True)
-                for ax, ar in [
-                    (1, 1),
-                    (0.7, 1.3),
-                ]:
-                    compare_fused_vs_native(x_bf16, res_f32, w, ax, ar)
+            # Test all supported dtypes
+            for x_dtype in [torch.bfloat16, torch.float16, torch.float32]:
+                x = torch.randn((M, N), dtype=x_dtype).requires_grad_(True)
+                for w_dtype in [torch.float32, torch.bfloat16]:
+                    w = torch.randn((N,), dtype=w_dtype).requires_grad_(True)
+                    for ax, ar in [
+                        (1, 1),
+                        (0.7, 1.3),
+                    ]:
+                        compare_fused_vs_native(
+                            x, res_f32.clone().requires_grad_(True), w, ax, ar
+                        )
+                        print(f"  ✓ {x_dtype}, w={w_dtype}, alpha=({ax},{ar})")
 
 
 __all__ = ["fused_rmsnorm_with_residual"]
