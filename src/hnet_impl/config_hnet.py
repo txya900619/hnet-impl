@@ -1,13 +1,12 @@
-from dataclasses import dataclass, field, asdict
 import json
+from dataclasses import asdict, dataclass, field
 
 import torch
 
-
 # Mapping for dtype serialization
+# NOTE: fp16 is NOT supported for training (gradient overflow issues)
 DTYPE_STR_MAP = {
     "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
     "float32": torch.float32,
 }
 DTYPE_TO_STR = {v: k for k, v in DTYPE_STR_MAP.items()}
@@ -62,8 +61,11 @@ class HNetConfig:
         if not self.N_compress:
             self.N_compress[:] = ([1], [1, 5], [1, 3, 9])[len(self.d_model) - 1]
         # Validate compute_dtype
-        assert self.compute_dtype in (torch.bfloat16, torch.float16, torch.float32), (
-            f"compute_dtype must be bfloat16, float16, or float32, got {self.compute_dtype}"
+        # NOTE: fp16 is NOT recommended for training due to limited dynamic range
+        # which causes gradient overflow in log1p, exp, and deep hierarchical structures.
+        # Use bfloat16 (recommended) or float32 instead.
+        assert self.compute_dtype in (torch.bfloat16, torch.float32), (
+            f"compute_dtype must be bfloat16 or float32 (fp16 not supported for training), got {self.compute_dtype}"
         )
 
     # learning rate modulation; \eta \propto sqrt(bsz*dim)
@@ -89,7 +91,9 @@ class HNetConfig:
                 dtype_str = c.pop("compute_dtype")
                 c["compute_dtype"] = DTYPE_STR_MAP.get(dtype_str, torch.bfloat16)
             if "compute_dtype" in k and isinstance(k["compute_dtype"], str):
-                k["compute_dtype"] = DTYPE_STR_MAP.get(k["compute_dtype"], torch.bfloat16)
+                k["compute_dtype"] = DTYPE_STR_MAP.get(
+                    k["compute_dtype"], torch.bfloat16
+                )
             return cls(**c, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg, **k)
 
     @classmethod

@@ -1,36 +1,37 @@
 import math
 import os
 import re
-from contextlib import nullcontext, contextmanager
-from functools import partial, cache
+from contextlib import contextmanager, nullcontext
+from functools import cache, partial
 
-### Borrowed kernels/modules
-from flash_attn.layers.rotary import apply_rotary_emb
-from flash_attn import flash_attn_varlen_func
-from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-
-from .torchisms import (
-    torch,
-    nn,
-    TT,
-    F,
-    fsdp,
-    dynamo,
-    ptd_checkpoint_wrapper,
-    dupe_fn,
-    unsafe_reduce_optimizedmodule_overhead,
-)
-from .conceptual import get_seq_idx, BlockBoundaryMixin
-from .lin import Lin
-from .norm import fused_rmsnorm_with_residual
-from .config_hnet import HNetConfig, get_stage_cfg
+import flash_attn
+import flash_attn.ops.triton.rotary as fa_rotary
 
 ###
 ### Patch flash-attn rotary to allow torch.compile ###
 import triton
-import flash_attn
-import flash_attn.ops.triton.rotary as fa_rotary
+from flash_attn import flash_attn_varlen_func
+
+### Borrowed kernels/modules
+from flash_attn.layers.rotary import apply_rotary_emb
+from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+
+from .conceptual import BlockBoundaryMixin, get_seq_idx
+from .config_hnet import HNetConfig, get_stage_cfg
+from .lin import Lin
+from .norm import fused_rmsnorm_with_residual
+from .torchisms import (
+    TT,
+    F,
+    dupe_fn,
+    dynamo,
+    fsdp,
+    nn,
+    ptd_checkpoint_wrapper,
+    torch,
+    unsafe_reduce_optimizedmodule_overhead,
+)
 
 assert flash_attn.__version__ == "2.8.1"
 
@@ -367,8 +368,9 @@ class Block(BlockBoundaryMixin, nn.Module, metaclass=BlockMeta):
         self, x: TT, residual: TT, cu_seqlens: TT, max_seqlen: int, seq_idx: TT
     ):
         assert residual.dtype == torch.float32, "residual must be fp32"
-        assert x.dtype in (torch.bfloat16, torch.float16, torch.float32), (
-            f"x must be bfloat16, float16, or float32, got {x.dtype}"
+        # NOTE: fp16 is not supported for training due to gradient overflow issues
+        assert x.dtype in (torch.bfloat16, torch.float32), (
+            f"x must be bfloat16 or float32 (fp16 not supported), got {x.dtype}"
         )
         x, residual = self.norm1(x, residual)
         if isinstance(self.mixer, Mamba2Simple):
@@ -474,8 +476,9 @@ class Isotropic(nn.Module):
 
 
 if __name__ == "__main__":
-    from .torchisms import make_chrometrace, random_x, ensure_no_cuda_sync
     from argparse import ArgumentParser
+
+    from .torchisms import ensure_no_cuda_sync, make_chrometrace, random_x
 
     # TORCH_LOGS=recompiles uv run -m hnet_impl.xf --s0=9289 --s1=2048 --d0=512 --d1=768 --lm=4 --lt=10
     ap = ArgumentParser()

@@ -321,9 +321,9 @@ class HNet(nn.Module):
                     -1, concated_h.shape[1]
                 )
                 h = torch.gather(concated_h, 0, h_pos_expanded)
-                return h, []
-
-            return self.main_network(x_flat, x_cu, msl)[..., :d_orig], []
+                return h, [], h
+            h = self.main_network(x_flat, x_cu, msl)[..., :d_orig]
+            return h, [], h
 
         r_flat = self.encoder(x_flat, x_cu, msl)
         p_flat, b_flat, select_cu = self.routing_module(r_flat, x_cu)
@@ -353,7 +353,7 @@ class HNet(nn.Module):
             else None
         )
 
-        h_select, extras = self.main_network(
+        h_select, extras, inner_stats = self.main_network(
             r_select,
             select_cu,
             pending_cpu_stats[0].item(),
@@ -387,7 +387,7 @@ class HNet(nn.Module):
             selected_tokens / chunkable_tokens,
         )
 
-        return x_flat, [extra] + extras
+        return x_flat, [extra] + extras, inner_stats
 
 
 class HNetLM(BlockBoundaryMixin, nn.Module):

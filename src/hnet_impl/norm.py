@@ -6,11 +6,11 @@ import triton.language as tl
 
 # Integer codes for dtype selection in triton kernels
 # These are used as constexpr values - triton will specialize kernels for each value
-# 0 = bfloat16, 1 = float16, 2 = float32
+# 0 = bfloat16, 1 = float32
+# NOTE: fp16 is NOT supported for training due to gradient overflow issues
 TORCH_DTYPE_TO_CODE = {
     torch.bfloat16: 0,
-    torch.float16: 1,
-    torch.float32: 2,
+    torch.float32: 1,
 }
 
 
@@ -26,13 +26,12 @@ def triton_autotune_configs(warp_size=32, max_threads_per_block=1024):
 @triton.jit
 def _cast_to_dtype(x, DTYPE_CODE: tl.constexpr):
     """Cast tensor to specified dtype using constexpr code for specialization.
-    DTYPE_CODE: 0=bfloat16, 1=float16, 2=float32
+    DTYPE_CODE: 0=bfloat16, 1=float32
+    NOTE: fp16 is not supported for training due to gradient overflow issues.
     """
     # Use literal integers - Triton will compile separate kernel versions for each value
     if DTYPE_CODE == 0:  # bfloat16
         return x.to(tl.bfloat16)
-    elif DTYPE_CODE == 1:  # float16
-        return x.to(tl.float16)
     else:  # float32
         return x.to(tl.float32)
 
@@ -163,8 +162,9 @@ class _RMSNormMixedPrecFn(torch.autograd.Function):
         x_dtype = x.dtype
 
         # shape & dtype checks
-        assert x_dtype in (torch.bfloat16, torch.float16, torch.float32), (
-            f"x must be bfloat16, float16, or float32, got {x_dtype}"
+        # NOTE: fp16 is not supported for training due to gradient overflow issues
+        assert x_dtype in (torch.bfloat16, torch.float32), (
+            f"x must be bfloat16 or float32 (fp16 not supported), got {x_dtype}"
         )
         assert residual_f32.dtype == torch.float32, "residual must be float32"
         assert x.shape == residual_f32.shape and x.ndim >= 2
@@ -314,9 +314,8 @@ def compare_fused_vs_native(x, res, w, ax, ar, eps=1e-5):
         grad_outputs=(g_y, g_r),
     )
 
-    # Compare (use larger tolerance for float16 due to lower precision)
-    rtol = 5e-2 if x.dtype == torch.float16 else 3e-2
-    atol = 5e-3 if x.dtype == torch.float16 else 3e-3
+    rtol = 3e-2
+    atol = 3e-3
 
     assert torch.allclose(y_fused, y_ref, rtol=rtol, atol=atol), (
         f"forward mismatch for {x.dtype}"
@@ -343,8 +342,8 @@ def test_fused_rmsnorm():
             (77, 1536),
         ]:
             res_f32 = torch.randn((M, N), dtype=torch.float32).requires_grad_(True)
-            # Test all supported dtypes
-            for x_dtype in [torch.bfloat16, torch.float16, torch.float32]:
+            # Test supported dtypes (fp16 not supported for training)
+            for x_dtype in [torch.bfloat16, torch.float32]:
                 x = torch.randn((M, N), dtype=x_dtype).requires_grad_(True)
                 for w_dtype in [torch.float32, torch.bfloat16]:
                     w = torch.randn((N,), dtype=w_dtype).requires_grad_(True)
